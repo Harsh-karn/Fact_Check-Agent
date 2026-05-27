@@ -1,9 +1,14 @@
 import streamlit as st
 import pymupdf  # PyMuPDF
-import google.generativeai as genai
+from google import genai
 from duckduckgo_search import DDGS
 import json
 import time
+import re
+
+
+# Model to use — change here if you need to swap models
+GEMINI_MODEL = "gemini-2.0-flash-lite"
 
 # --- Configuration & Setup ---
 st.set_page_config(page_title="Fact-Check Agent", page_icon="🕵️", layout="wide")
@@ -20,22 +25,40 @@ with st.sidebar:
         st.warning("Please enter a Gemini API Key to continue.")
         st.stop()
     else:
-        try:
-            genai.configure(api_key=api_key)
-            # Test if the API key works
-            model = genai.GenerativeModel('gemini-1.5-flash')
-        except Exception as e:
-            st.error(f"Error configuring Gemini API: {e}")
-            st.stop()
+        client = genai.Client(api_key=api_key)
+        st.success("API Key accepted ✓")
 
 # --- Helper Functions ---
+
+def call_gemini_with_retry(client, prompt, max_retries=3):
+    """Calls Gemini with automatic retry on rate limit errors."""
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            return response.text
+        except Exception as e:
+            error_str = str(e)
+            # Check if it's a rate limit error with a retry delay
+            if "429" in error_str and "retryDelay" in error_str:
+                # Extract retry delay from error message
+                try:
+                    import re
+                    delay_match = re.search(r"'retryDelay': '(\d+)s'", error_str)
+                    wait_secs = int(delay_match.group(1)) if delay_match else 30
+                except Exception:
+                    wait_secs = 30
+                if attempt < max_retries - 1:
+                    st.info(f"⏳ Rate limit hit. Waiting {wait_secs}s before retry {attempt + 2}/{max_retries}...")
+                    time.sleep(wait_secs + 2)
+                    continue
+            raise e
+    return None
 
 @st.cache_data
 def extract_text_from_pdf(uploaded_file):
     """Extracts text from an uploaded PDF file."""
     text = ""
     try:
-        # read() gets the bytes
         doc = pymupdf.open(stream=uploaded_file.read(), filetype="pdf")
         for page in doc:
             text += page.get_text()
@@ -44,9 +67,9 @@ def extract_text_from_pdf(uploaded_file):
         st.error(f"Error extracting text from PDF: {e}")
         return None
 
-def extract_claims(text):
+def extract_claims(client, text):
     """Uses Gemini to extract factual claims from the text."""
-    prompt = """
+    prompt = f"""
     You are an expert fact-checker. I will provide you with text extracted from a document.
     Your task is to identify and extract specific factual claims made in the text.
     Focus on:
@@ -54,7 +77,7 @@ def extract_claims(text):
     - Dates and historical events
     - Financial figures
     - Technical or scientific claims
-    
+
     Output the claims as a valid JSON list of strings. Do not include any other text or markdown formatting.
     Example:
     [
@@ -62,23 +85,25 @@ def extract_claims(text):
         "The company revenue grew by 200% in 2023.",
         "Water boils at 90 degrees Celsius."
     ]
-    
+
     Text to analyze:
     ---
     {text}
     """
     try:
-        response = model.generate_content(prompt.format(text=text))
-        
+        response_text = call_gemini_with_retry(client, prompt)
+        if not response_text:
+            return []
+
         # Clean up potential markdown formatting in response
-        response_text = response.text.strip()
+        response_text = response_text.strip()
         if response_text.startswith("```json"):
             response_text = response_text[7:]
         if response_text.startswith("```"):
             response_text = response_text[3:]
         if response_text.endswith("```"):
             response_text = response_text[:-3]
-            
+
         claims = json.loads(response_text.strip())
         return claims
     except json.JSONDecodeError:
@@ -99,12 +124,12 @@ def search_web(query):
         st.warning(f"Web search failed for query '{query}': {e}")
         return "No search results found."
 
-def verify_claim(claim, search_context):
+def verify_claim(client, claim, search_context):
     """Uses Gemini to evaluate a claim against search results."""
-    prompt = """
+    prompt = f"""
     You are an expert fact-checker. I will provide you with a 'Claim' and 'Web Search Results' related to that claim.
     Your task is to cross-reference the claim against the search results and determine its accuracy.
-    
+
     Categorize the claim into exactly one of these statuses:
     - "Verified": The search results confirm the claim is true.
     - "Inaccurate": The claim has some truth but contains outdated, misleading, or incorrect specific details.
@@ -117,23 +142,25 @@ def verify_claim(claim, search_context):
     - "correct_facts": The actual correct facts based on the search results (if the claim is Inaccurate or False). If Verified or Unverified, you can leave this empty or provide a confirming note.
 
     Claim to verify: "{claim}"
-    
+
     Web Search Results:
     ---
     {search_context}
     """
     try:
-        response = model.generate_content(prompt.format(claim=claim, search_context=search_context))
-        
+        response_text = call_gemini_with_retry(client, prompt)
+        if not response_text:
+            return {"status": "Error", "explanation": "No response from model.", "correct_facts": "N/A"}
+
         # Clean up JSON
-        response_text = response.text.strip()
+        response_text = response_text.strip()
         if response_text.startswith("```json"):
             response_text = response_text[7:]
         if response_text.startswith("```"):
             response_text = response_text[3:]
         if response_text.endswith("```"):
             response_text = response_text[:-3]
-            
+
         verification_result = json.loads(response_text.strip())
         return verification_result
     except Exception as e:
@@ -148,30 +175,30 @@ def verify_claim(claim, search_context):
 uploaded_file = st.file_uploader("Upload a PDF document to analyze", type=["pdf"])
 
 if uploaded_file is not None:
-    if st.button("Analyze Document"):
+    if st.button("🔍 Analyze Document"):
         with st.spinner("Extracting text from PDF..."):
             pdf_text = extract_text_from_pdf(uploaded_file)
-            
+
         if pdf_text:
             st.success("Text extracted successfully!")
-            
-            with st.spinner("Extracting factual claims..."):
-                claims = extract_claims(pdf_text)
-                
+
+            with st.spinner("Extracting factual claims with AI..."):
+                claims = extract_claims(client, pdf_text)
+
             if claims:
                 st.write(f"Found **{len(claims)}** claims to verify. Commencing web search and verification...")
-                
+
                 # Progress bar for verification
                 progress_bar = st.progress(0)
-                
+
                 results_data = []
                 for i, claim in enumerate(claims):
                     # Search web
                     search_context = search_web(claim)
-                    
+
                     # Verify
-                    verification = verify_claim(claim, search_context)
-                    
+                    verification = verify_claim(client, claim, search_context)
+
                     # Store
                     results_data.append({
                         "claim": claim,
@@ -179,16 +206,17 @@ if uploaded_file is not None:
                         "explanation": verification.get("explanation", ""),
                         "correct_facts": verification.get("correct_facts", "")
                     })
-                    
+
                     # Update progress
                     progress_bar.progress((i + 1) / len(claims))
-                    
-                    # Small delay to respect rate limits if needed (DDGS can be picky)
-                    time.sleep(1)
-                
+
+                    # Delay between verifications to avoid per-minute rate limits
+                    if i < len(claims) - 1:
+                        time.sleep(3)
+
                 # Display Results
-                st.header("Verification Report")
-                
+                st.header("📋 Verification Report")
+
                 for res in results_data:
                     status = res['status']
                     if status == "Verified":
@@ -199,12 +227,12 @@ if uploaded_file is not None:
                         st.error(f"**Claim:** {res['claim']}")
                     else:
                         st.info(f"**Claim:** {res['claim']}")
-                        
+
                     st.markdown(f"**Status:** {status}")
                     st.markdown(f"**Explanation:** {res['explanation']}")
                     if res['correct_facts']:
                         st.markdown(f"**Correct Facts:** {res['correct_facts']}")
                     st.divider()
-                    
+
             else:
                 st.warning("No clear factual claims could be extracted from this document.")
