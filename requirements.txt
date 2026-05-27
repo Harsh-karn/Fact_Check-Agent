@@ -2,4 +2,5 @@ streamlit
 google-genai
 duckduckgo-search
 pymupdf
+groq
 python-dotenv

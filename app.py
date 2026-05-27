@@ -1,238 +1,305 @@
 import streamlit as st
 import pymupdf  # PyMuPDF
-from google import genai
 from duckduckgo_search import DDGS
 import json
 import time
 import re
 
-
-# Model to use — change here if you need to swap models
-GEMINI_MODEL = "gemini-2.0-flash-lite"
-
-# --- Configuration & Setup ---
+# --- Page Config ---
 st.set_page_config(page_title="Fact-Check Agent", page_icon="🕵️", layout="wide")
 
-st.title("🕵️ The Fact-Checking Web App")
-st.markdown("Upload a PDF to automatically extract factual claims, cross-reference them against live web data, and verify their accuracy.")
-
-# --- Sidebar for API Key ---
+# --- Sidebar: Provider Selection & API Key ---
 with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("Enter your Gemini API Key:", type="password")
-    st.markdown("[Get a Gemini API Key](https://aistudio.google.com/app/apikey)")
+    st.title("⚙️ Configuration")
+
+    provider = st.radio(
+        "Choose AI Provider",
+        ["Groq (Free & Fast ⚡)", "Gemini (Google)"],
+        help="Groq is recommended — free, fast, and no daily quota issues."
+    )
+
+    if provider == "Groq (Free & Fast ⚡)":
+        api_key = st.text_input(
+            "Groq API Key:",
+            type="password",
+            placeholder="gsk_..."
+        )
+        st.markdown(
+            "🔑 [Get a free Groq API Key](https://console.groq.com/keys) — sign up is instant, no billing needed.",
+            unsafe_allow_html=False
+        )
+        GROQ_MODEL = "llama-3.3-70b-versatile"
+    else:
+        api_key = st.text_input(
+            "Gemini API Key:",
+            type="password",
+            placeholder="AIza..."
+        )
+        st.markdown(
+            "🔑 [Get a Gemini API Key](https://aistudio.google.com/app/apikey)",
+            unsafe_allow_html=False
+        )
+        GEMINI_MODEL = "gemini-2.0-flash-lite"
+
     if not api_key:
-        st.warning("Please enter a Gemini API Key to continue.")
+        st.warning("Please enter an API key to continue.")
         st.stop()
     else:
-        client = genai.Client(api_key=api_key)
         st.success("API Key accepted ✓")
 
-# --- Helper Functions ---
+    st.divider()
+    st.markdown("**How it works:**")
+    st.markdown("1. 📄 Upload a PDF")
+    st.markdown("2. 🤖 AI extracts factual claims")
+    st.markdown("3. 🌐 Web searches verify each claim")
+    st.markdown("4. ✅ Results flagged as Verified / Inaccurate / False")
 
-def call_gemini_with_retry(client, prompt, max_retries=3):
-    """Calls Gemini with automatic retry on rate limit errors."""
-    for attempt in range(max_retries):
+# --- LLM Call Functions ---
+
+def call_groq(api_key, prompt):
+    """Call Groq LLM API."""
+    from groq import Groq
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    return response.choices[0].message.content
+
+def call_gemini(api_key, prompt):
+    """Call Gemini API with retry logic."""
+    from google import genai
+    client = genai.Client(api_key=api_key)
+    for attempt in range(3):
         try:
             response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             return response.text
         except Exception as e:
             error_str = str(e)
-            # Check if it's a rate limit error with a retry delay
-            if "429" in error_str and "retryDelay" in error_str:
-                # Extract retry delay from error message
-                try:
-                    import re
-                    delay_match = re.search(r"'retryDelay': '(\d+)s'", error_str)
-                    wait_secs = int(delay_match.group(1)) if delay_match else 30
-                except Exception:
-                    wait_secs = 30
-                if attempt < max_retries - 1:
-                    st.info(f"⏳ Rate limit hit. Waiting {wait_secs}s before retry {attempt + 2}/{max_retries}...")
+            if "429" in error_str:
+                delay_match = re.search(r"retryDelay.*?(\d+)s", error_str)
+                wait_secs = int(delay_match.group(1)) if delay_match else 30
+                if attempt < 2:
+                    st.info(f"⏳ Rate limit hit. Waiting {wait_secs}s before retry {attempt + 2}/3...")
                     time.sleep(wait_secs + 2)
                     continue
             raise e
     return None
 
+def call_llm(prompt):
+    """Route the LLM call to the selected provider."""
+    if provider == "Groq (Free & Fast ⚡)":
+        return call_groq(api_key, prompt)
+    else:
+        return call_gemini(api_key, prompt)
+
+# --- Core Logic Functions ---
+
 @st.cache_data
-def extract_text_from_pdf(uploaded_file):
-    """Extracts text from an uploaded PDF file."""
-    text = ""
+def extract_text_from_pdf(file_bytes):
+    """Extract text from PDF bytes."""
     try:
-        doc = pymupdf.open(stream=uploaded_file.read(), filetype="pdf")
-        for page in doc:
-            text += page.get_text()
-        return text
+        doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+        return "".join(page.get_text() for page in doc)
     except Exception as e:
-        st.error(f"Error extracting text from PDF: {e}")
+        st.error(f"Error reading PDF: {e}")
         return None
 
-def extract_claims(client, text):
-    """Uses Gemini to extract factual claims from the text."""
-    prompt = f"""
-    You are an expert fact-checker. I will provide you with text extracted from a document.
-    Your task is to identify and extract specific factual claims made in the text.
-    Focus on:
-    - Statistics and numbers
-    - Dates and historical events
-    - Financial figures
-    - Technical or scientific claims
+def clean_json(text):
+    """Strip markdown code fences from LLM output."""
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
 
-    Output the claims as a valid JSON list of strings. Do not include any other text or markdown formatting.
-    Example:
-    [
-        "The Eiffel Tower is 5 feet tall.",
-        "The company revenue grew by 200% in 2023.",
-        "Water boils at 90 degrees Celsius."
-    ]
+def extract_claims(text):
+    """Use LLM to extract factual claims from document text."""
+    # Truncate very long documents to avoid token limits
+    truncated = text[:12000] if len(text) > 12000 else text
 
-    Text to analyze:
-    ---
-    {text}
-    """
+    prompt = f"""You are an expert fact-checker analyzing a document.
+Extract all specific, verifiable factual claims from the text below.
+Focus ONLY on concrete, checkable facts:
+- Statistics and percentages
+- Dates and years
+- Named financial figures (revenue, market cap, funding)
+- Technical specifications
+- Record-breaking or superlative claims
+
+Return a valid JSON array of strings. Each string should be a single, self-contained claim.
+Do NOT include opinions, vague statements, or marketing language.
+Output ONLY the JSON array with no other text.
+
+Example output:
+["Apple revenue was $394 billion in 2022.", "The Eiffel Tower is 330 meters tall.", "Bitcoin reached $69,000 in November 2021."]
+
+Document text:
+---
+{truncated}
+"""
     try:
-        response_text = call_gemini_with_retry(client, prompt)
-        if not response_text:
+        raw = call_llm(prompt)
+        if not raw:
             return []
-
-        # Clean up potential markdown formatting in response
-        response_text = response_text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-
-        claims = json.loads(response_text.strip())
-        return claims
+        return json.loads(clean_json(raw))
     except json.JSONDecodeError:
-        st.error("Failed to parse claims. The model did not return valid JSON.")
+        st.error("⚠️ Could not parse claims as JSON. The model returned unexpected output.")
         return []
     except Exception as e:
         st.error(f"Error extracting claims: {e}")
         return []
 
 def search_web(query):
-    """Searches the web using DuckDuckGo."""
+    """Search DuckDuckGo for evidence about a claim."""
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
-            search_context = "\n\n".join([f"Source: {res.get('href')}\nSnippet: {res.get('body')}" for res in results])
-            return search_context
+            results = list(ddgs.text(query, max_results=4))
+            if not results:
+                return "No search results found."
+            return "\n\n".join(
+                f"Source: {r.get('href', 'N/A')}\nSnippet: {r.get('body', '')}"
+                for r in results
+            )
     except Exception as e:
-        st.warning(f"Web search failed for query '{query}': {e}")
-        return "No search results found."
+        return f"Search failed: {e}"
 
-def verify_claim(client, claim, search_context):
-    """Uses Gemini to evaluate a claim against search results."""
-    prompt = f"""
-    You are an expert fact-checker. I will provide you with a 'Claim' and 'Web Search Results' related to that claim.
-    Your task is to cross-reference the claim against the search results and determine its accuracy.
+def verify_claim(claim, search_context):
+    """Use LLM to evaluate a claim against web evidence."""
+    prompt = f"""You are a strict, impartial fact-checker.
 
-    Categorize the claim into exactly one of these statuses:
-    - "Verified": The search results confirm the claim is true.
-    - "Inaccurate": The claim has some truth but contains outdated, misleading, or incorrect specific details.
-    - "False": The claim is entirely wrong or contradicts the search results.
-    - "Unverified": There is not enough information in the search results to determine.
+Given the claim and web search results below, evaluate the claim's accuracy.
 
-    You must output a JSON object with the following keys:
-    - "status": The categorization (Verified, Inaccurate, False, Unverified).
-    - "explanation": A brief explanation of why you gave this status.
-    - "correct_facts": The actual correct facts based on the search results (if the claim is Inaccurate or False). If Verified or Unverified, you can leave this empty or provide a confirming note.
+CLAIM: "{claim}"
 
-    Claim to verify: "{claim}"
+WEB SEARCH RESULTS:
+---
+{search_context}
+---
 
-    Web Search Results:
-    ---
-    {search_context}
-    """
+Classify the claim as ONE of:
+- "Verified": Search results clearly confirm the claim is accurate.
+- "Inaccurate": The claim has some basis but contains wrong numbers, outdated info, or misleading details.
+- "False": The claim directly contradicts the evidence, or is fabricated with no basis.
+- "Unverified": Insufficient evidence to confirm or deny.
+
+Respond ONLY with a JSON object in this exact format:
+{{
+  "status": "Verified" | "Inaccurate" | "False" | "Unverified",
+  "explanation": "One sentence explaining your verdict.",
+  "correct_facts": "The accurate information if the claim is wrong, otherwise leave empty."
+}}"""
     try:
-        response_text = call_gemini_with_retry(client, prompt)
-        if not response_text:
-            return {"status": "Error", "explanation": "No response from model.", "correct_facts": "N/A"}
-
-        # Clean up JSON
-        response_text = response_text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-
-        verification_result = json.loads(response_text.strip())
-        return verification_result
+        raw = call_llm(prompt)
+        if not raw:
+            return {"status": "Error", "explanation": "No response from model.", "correct_facts": ""}
+        return json.loads(clean_json(raw))
     except Exception as e:
-        return {
-            "status": "Error",
-            "explanation": f"Failed to verify claim due to an error: {e}",
-            "correct_facts": "N/A"
-        }
+        return {"status": "Error", "explanation": str(e), "correct_facts": ""}
 
 # --- Main App UI ---
 
-uploaded_file = st.file_uploader("Upload a PDF document to analyze", type=["pdf"])
+st.title("🕵️ Fact-Checking Agent")
+st.markdown(
+    "Upload any PDF — the AI will extract specific factual claims, search the web to verify them, "
+    "and flag each one as **✅ Verified**, **⚠️ Inaccurate**, or **❌ False**."
+)
 
-if uploaded_file is not None:
-    if st.button("🔍 Analyze Document"):
-        with st.spinner("Extracting text from PDF..."):
-            pdf_text = extract_text_from_pdf(uploaded_file)
+uploaded_file = st.file_uploader("📄 Upload PDF", type=["pdf"], label_visibility="collapsed")
 
-        if pdf_text:
-            st.success("Text extracted successfully!")
+if uploaded_file:
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.info(f"**File:** {uploaded_file.name} ({uploaded_file.size // 1024} KB)")
+    with col2:
+        analyze = st.button("🔍 Analyze Document", use_container_width=True, type="primary")
 
-            with st.spinner("Extracting factual claims with AI..."):
-                claims = extract_claims(client, pdf_text)
+    if analyze:
+        # Step 1: Extract text
+        with st.spinner("📖 Reading PDF..."):
+            file_bytes = uploaded_file.read()
+            pdf_text = extract_text_from_pdf(file_bytes)
 
-            if claims:
-                st.write(f"Found **{len(claims)}** claims to verify. Commencing web search and verification...")
+        if not pdf_text or len(pdf_text.strip()) < 50:
+            st.error("Could not extract meaningful text from this PDF. Please try another file.")
+            st.stop()
 
-                # Progress bar for verification
-                progress_bar = st.progress(0)
+        # Step 2: Extract claims
+        with st.spinner("🤖 Extracting factual claims with AI..."):
+            claims = extract_claims(pdf_text)
 
-                results_data = []
-                for i, claim in enumerate(claims):
-                    # Search web
-                    search_context = search_web(claim)
+        if not claims:
+            st.warning("No specific, verifiable claims were found in this document.")
+            st.stop()
 
-                    # Verify
-                    verification = verify_claim(client, claim, search_context)
+        st.success(f"Found **{len(claims)} claims** to verify!")
 
-                    # Store
-                    results_data.append({
-                        "claim": claim,
-                        "status": verification.get("status", "Unknown"),
-                        "explanation": verification.get("explanation", ""),
-                        "correct_facts": verification.get("correct_facts", "")
-                    })
+        # Step 3: Verify each claim
+        st.subheader("📋 Verification Report")
+        progress = st.progress(0, text="Starting verification...")
+        results = []
 
-                    # Update progress
-                    progress_bar.progress((i + 1) / len(claims))
+        for i, claim in enumerate(claims):
+            progress.progress(
+                (i + 1) / len(claims),
+                text=f"Verifying claim {i + 1} of {len(claims)}..."
+            )
 
-                    # Delay between verifications to avoid per-minute rate limits
-                    if i < len(claims) - 1:
-                        time.sleep(3)
+            # Web search
+            search_ctx = search_web(claim)
 
-                # Display Results
-                st.header("📋 Verification Report")
+            # LLM verification
+            verdict = verify_claim(claim, search_ctx)
+            verdict["claim"] = claim
+            results.append(verdict)
 
-                for res in results_data:
-                    status = res['status']
-                    if status == "Verified":
-                        st.success(f"**Claim:** {res['claim']}")
-                    elif status == "Inaccurate":
-                        st.warning(f"**Claim:** {res['claim']}")
-                    elif status == "False":
-                        st.error(f"**Claim:** {res['claim']}")
-                    else:
-                        st.info(f"**Claim:** {res['claim']}")
+            # Delay to avoid rate limits (Groq is generous but still has RPM limits)
+            if i < len(claims) - 1:
+                time.sleep(2)
 
-                    st.markdown(f"**Status:** {status}")
-                    st.markdown(f"**Explanation:** {res['explanation']}")
-                    if res['correct_facts']:
-                        st.markdown(f"**Correct Facts:** {res['correct_facts']}")
-                    st.divider()
+        progress.empty()
 
+        # Step 4: Display results
+        verified = sum(1 for r in results if r["status"] == "Verified")
+        inaccurate = sum(1 for r in results if r["status"] == "Inaccurate")
+        false_count = sum(1 for r in results if r["status"] == "False")
+        unverified = sum(1 for r in results if r["status"] not in ["Verified", "Inaccurate", "False"])
+
+        # Summary metrics
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("✅ Verified", verified)
+        m2.metric("⚠️ Inaccurate", inaccurate)
+        m3.metric("❌ False", false_count)
+        m4.metric("❓ Unverified", unverified)
+
+        st.divider()
+
+        # Detailed results
+        for res in results:
+            status = res.get("status", "Unknown")
+            claim_text = res.get("claim", "")
+            explanation = res.get("explanation", "")
+            correct_facts = res.get("correct_facts", "")
+
+            if status == "Verified":
+                container = st.success
+                icon = "✅"
+            elif status == "Inaccurate":
+                container = st.warning
+                icon = "⚠️"
+            elif status == "False":
+                container = st.error
+                icon = "❌"
             else:
-                st.warning("No clear factual claims could be extracted from this document.")
+                container = st.info
+                icon = "❓"
+
+            with st.expander(f"{icon} **{status}** — {claim_text[:90]}{'...' if len(claim_text) > 90 else ''}", expanded=True):
+                st.markdown(f"**Full Claim:** {claim_text}")
+                st.markdown(f"**Verdict:** {explanation}")
+                if correct_facts:
+                    st.markdown(f"**✔ Correct Facts:** {correct_facts}")
