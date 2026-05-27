@@ -4,6 +4,8 @@
 
 ### *The AI-Powered Truth Layer for Any Document*
 
+> ### 🚀 [**▶ Try the Live App → factcheck-agentz.streamlit.app**](https://factcheck-agentz.streamlit.app/)
+
 [![Live Demo](https://img.shields.io/badge/🌐_Live_Demo-Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://factcheck-agentz.streamlit.app/)
 [![GitHub](https://img.shields.io/badge/GitHub-Harsh--karn-181717?style=for-the-badge&logo=github)](https://github.com/Harsh-karn/Fact_Check-Agent)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
